@@ -36,14 +36,21 @@ pub struct ConnectOptions {
     /// the session the broker kept for its client identifier, for example after a process
     /// restart. The broker's subscriptions and queued messages are resumed, but any
     /// outbound or inbound `QoS` 1/2 exchanges the previous process had in flight are lost
-    /// locally, so delivery across the restart is at-least-once: this is the deferred-ack
-    /// crash-recovery pattern, where messages whose `AckToken` was never resolved are
-    /// redelivered to the new process. It has no effect on `Clean Start = 1` connections.
+    /// locally. Inbound delivery across the restart is at-least-once: this is the
+    /// deferred-ack crash-recovery pattern, where messages whose `AckToken` was never
+    /// resolved are redelivered to the new process. Outbound publishes are not resent: a
+    /// publish whose `PublishHandle` had not completed, including one still in the offline
+    /// queue, may never reach subscribers, so the application must publish it again if it
+    /// still needs it delivered. It has no effect on `Clean Start = 1` connections.
     ///
     /// The broker only keeps a session to resume if the previous connection set a non-zero
     /// Session Expiry Interval (`with_session_expiry_interval`): under MQTT v5 an absent
     /// Session Expiry Interval means 0, so the session ends when the connection closes.
     pub resume_existing_session: bool,
+    /// WebSocket configuration for ws:// and wss:// connections; see
+    /// [`ConnectOptions::with_websocket_config`].
+    #[cfg(feature = "transport-websocket")]
+    pub websocket_config: Option<Arc<crate::transport::websocket::WebSocketConfig>>,
 }
 
 impl ConnectOptions {
@@ -57,7 +64,43 @@ impl ConnectOptions {
             codec_registry: None,
             deferred_ack: false,
             resume_existing_session: false,
+            #[cfg(feature = "transport-websocket")]
+            websocket_config: None,
         }
+    }
+
+    /// Sets the WebSocket configuration for ws:// and wss:// connections
+    ///
+    /// It is applied on every connection attempt, including automatic
+    /// reconnects: its custom headers, subprotocols, user agent and timeout go
+    /// into each upgrade request, and for wss:// its TLS configuration, when it
+    /// has one, is used in place of the one stored with `set_tls_config` or
+    /// `connect_with_tls` (`set_insecure_tls(true)` still disables
+    /// verification). The client connects to the address passed to `connect`,
+    /// so the configuration's own `url` is not used; build it from that
+    /// address or any URL with the same scheme.
+    ///
+    /// ```rust,no_run
+    /// # use mqtt5::{ConnectOptions, MqttClient};
+    /// # use mqtt5::transport::websocket::WebSocketConfig;
+    /// # async fn example() -> mqtt5::Result<()> {
+    /// let address = "wss://broker.example.com/mqtt";
+    /// let websocket = WebSocketConfig::new(address)?
+    ///     .with_header("x-amz-customauthorizer-name", "my-authorizer");
+    /// let options = ConnectOptions::new("client-1").with_websocket_config(websocket);
+    /// let client = MqttClient::with_options(options);
+    /// client.connect(address).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(feature = "transport-websocket")]
+    #[must_use]
+    pub fn with_websocket_config(
+        mut self,
+        config: crate::transport::websocket::WebSocketConfig,
+    ) -> Self {
+        self.websocket_config = Some(Arc::new(config));
+        self
     }
 
     /// Opts in to resuming a broker-held session without local session state.
@@ -245,7 +288,8 @@ impl ConnectOptions {
 
 impl std::fmt::Debug for ConnectOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ConnectOptions")
+        let mut debug = f.debug_struct("ConnectOptions");
+        debug
             .field("protocol_options", &self.protocol_options)
             .field("session_config", &self.session_config)
             .field("reconnect_config", &self.reconnect_config)
@@ -255,8 +299,10 @@ impl std::fmt::Debug for ConnectOptions {
                 &self.codec_registry.as_ref().map(|_| "CodecRegistry"),
             )
             .field("deferred_ack", &self.deferred_ack)
-            .field("resume_existing_session", &self.resume_existing_session)
-            .finish()
+            .field("resume_existing_session", &self.resume_existing_session);
+        #[cfg(feature = "transport-websocket")]
+        debug.field("websocket_config", &self.websocket_config);
+        debug.finish()
     }
 }
 

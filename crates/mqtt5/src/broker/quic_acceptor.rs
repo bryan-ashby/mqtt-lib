@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio::sync::{broadcast, mpsc, watch, Mutex};
 use tracing::{debug, error, instrument, trace, warn};
 
 use super::tls_acceptor::TlsAcceptorConfig;
@@ -457,6 +457,7 @@ fn build_flow_header_result(flow_header: FlowHeader, leftover: BytesMut) -> Flow
 pub(super) async fn read_packet_with_buffer(
     recv: &mut RecvStream,
     buffer: &mut BytesMut,
+    protocol_version: u8,
 ) -> Result<Packet> {
     while buffer.len() < 2 {
         let mut tmp = [0u8; 64];
@@ -526,83 +527,53 @@ pub(super) async fn read_packet_with_buffer(
     let fixed_header = FixedHeader::decode(&mut header_buf)?;
 
     let mut payload_buf = BytesMut::from(&packet_bytes[header_len..]);
-    Packet::decode_from_body(fixed_header.packet_type, &fixed_header, &mut payload_buf)
+    Packet::decode_from_body_with_version(
+        fixed_header.packet_type,
+        &fixed_header,
+        &mut payload_buf,
+        protocol_version,
+    )
 }
 
-#[allow(clippy::too_many_arguments)]
-#[instrument(skip(connection, config, router, auth_provider, storage, stats, resource_monitor, shutdown_rx), fields(peer_addr = %peer_addr))]
+pub struct QuicHandlerContext {
+    pub config: Arc<BrokerConfig>,
+    pub router: Arc<MessageRouter>,
+    pub auth_provider: Arc<dyn AuthProvider>,
+    pub storage: Option<Arc<DynamicStorage>>,
+    pub stats: Arc<BrokerStats>,
+    pub resource_monitor: Arc<ResourceMonitor>,
+    pub shutdown_rx: broadcast::Receiver<()>,
+    pub connection_alive: mpsc::Sender<()>,
+}
+
+#[instrument(skip(connection, context), fields(peer_addr = %peer_addr))]
 pub async fn run_quic_connection_handler(
     connection: Arc<Connection>,
     peer_addr: SocketAddr,
-    config: Arc<BrokerConfig>,
-    router: Arc<MessageRouter>,
-    auth_provider: Arc<dyn AuthProvider>,
-    storage: Option<Arc<DynamicStorage>>,
-    stats: Arc<BrokerStats>,
-    resource_monitor: Arc<ResourceMonitor>,
-    shutdown_rx: broadcast::Receiver<()>,
+    context: QuicHandlerContext,
 ) {
-    run_quic_handler_inner(
-        connection,
-        peer_addr,
-        config,
-        router,
-        auth_provider,
-        storage,
-        stats,
-        resource_monitor,
-        shutdown_rx,
-        false,
-        "QUIC",
-    )
-    .await;
+    run_quic_handler_inner(connection, peer_addr, context, false, "QUIC").await;
 }
 
-#[allow(clippy::too_many_arguments)]
 pub async fn run_quic_cluster_connection_handler(
     connection: Arc<Connection>,
     peer_addr: SocketAddr,
-    config: Arc<BrokerConfig>,
-    router: Arc<MessageRouter>,
-    auth_provider: Arc<dyn AuthProvider>,
-    storage: Option<Arc<DynamicStorage>>,
-    stats: Arc<BrokerStats>,
-    resource_monitor: Arc<ResourceMonitor>,
-    shutdown_rx: broadcast::Receiver<()>,
+    context: QuicHandlerContext,
 ) {
-    run_quic_handler_inner(
-        connection,
-        peer_addr,
-        config,
-        router,
-        auth_provider,
-        storage,
-        stats,
-        resource_monitor,
-        shutdown_rx,
-        true,
-        "Cluster QUIC",
-    )
-    .await;
+    run_quic_handler_inner(connection, peer_addr, context, true, "Cluster QUIC").await;
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_quic_handler_inner(
     connection: Arc<Connection>,
     peer_addr: SocketAddr,
-    config: Arc<BrokerConfig>,
-    router: Arc<MessageRouter>,
-    auth_provider: Arc<dyn AuthProvider>,
-    storage: Option<Arc<DynamicStorage>>,
-    stats: Arc<BrokerStats>,
-    resource_monitor: Arc<ResourceMonitor>,
-    shutdown_rx: broadcast::Receiver<()>,
+    context: QuicHandlerContext,
     skip_bridge_forwarding: bool,
     label: &'static str,
 ) {
     let (packet_tx, packet_rx) = mpsc::channel::<(Packet, Option<u64>)>(100);
     let (flow_closed_tx, flow_closed_rx) = mpsc::channel::<u64>(32);
     let flow_registry = Arc::new(Mutex::new(FlowRegistry::new(256)));
+    let (protocol_version_tx, protocol_version_rx) = watch::channel(None);
 
     let (send, recv) = match connection.accept_bi().await {
         Ok(streams) => streams,
@@ -621,43 +592,56 @@ async fn run_quic_handler_inner(
     let stream = QuicStreamWrapper::new(send, recv, peer_addr);
     let transport = BrokerTransport::quic(stream);
 
-    let delivery_strategy = config.server_delivery_strategy;
+    let delivery_strategy = context.config.server_delivery_strategy;
+    let connection_alive = context.connection_alive;
     let handler = ClientHandler::new_with_external_packets(
         transport,
         peer_addr,
-        config,
-        router,
-        auth_provider,
-        storage,
-        stats,
-        resource_monitor,
-        shutdown_rx,
+        context.config,
+        context.router,
+        context.auth_provider,
+        context.storage,
+        context.stats,
+        context.resource_monitor,
+        context.shutdown_rx,
         Some(packet_rx),
     )
     .with_quic_connection(connection.clone())
     .with_server_delivery_strategy(delivery_strategy)
     .with_quic_packet_tx(packet_tx.clone())
+    .with_quic_protocol_version_tx(protocol_version_tx)
     .with_skip_bridge_forwarding(skip_bridge_forwarding)
     .with_flow_closed_rx(flow_closed_rx)
     .with_flow_registry(flow_registry.clone());
 
     let handler_label = label;
+    let handler_connection = connection.clone();
     tokio::spawn(async move {
-        if let Err(e) = handler.run().await {
+        let outcome = handler.run().await;
+        drop(connection_alive);
+        if let Err(e) = &outcome {
             if e.is_normal_disconnect() {
                 debug!("{} client handler finished", handler_label);
             } else {
                 warn!("{} client handler error: {e}", handler_label);
             }
         }
+        close_after_control_flow(&handler_connection, peer_addr, &outcome).await;
     });
 
-    spawn_datagram_reader(connection.clone(), packet_tx.clone(), peer_addr, label);
+    spawn_datagram_reader(
+        connection.clone(),
+        packet_tx.clone(),
+        protocol_version_rx.clone(),
+        peer_addr,
+        label,
+    );
     spawn_bi_accept_loop(connection.clone(), flow_registry.clone(), peer_addr, label);
     spawn_quic_stats_sampler(connection.clone(), peer_addr);
     spawn_uni_accept_loop(
         connection,
         packet_tx,
+        protocol_version_rx,
         peer_addr,
         flow_registry,
         flow_closed_tx,
@@ -728,13 +712,25 @@ fn quic_stats_row(connection: &Connection) -> String {
     )
 }
 
+async fn negotiated_protocol_version(mut rx: watch::Receiver<Option<u8>>) -> Option<u8> {
+    rx.wait_for(Option::is_some)
+        .await
+        .ok()
+        .and_then(|version| *version)
+}
+
 fn spawn_datagram_reader(
     connection: Arc<Connection>,
     packet_tx: mpsc::Sender<(Packet, Option<u64>)>,
+    protocol_version_rx: watch::Receiver<Option<u8>>,
     peer_addr: SocketAddr,
     label: &'static str,
 ) {
     tokio::spawn(async move {
+        let Some(protocol_version) = negotiated_protocol_version(protocol_version_rx).await else {
+            debug!("{label} client handler ended before CONNECT from {peer_addr}");
+            return;
+        };
         loop {
             match connection.read_datagram().await {
                 Ok(datagram) => {
@@ -744,21 +740,17 @@ fn spawn_datagram_reader(
                         label,
                         peer_addr
                     );
-                    #[allow(
-                        clippy::collapsible_match,
-                        reason = "cannot move `packet` into async send from a pattern guard"
-                    )]
-                    match decode_datagram_packet(&datagram) {
-                        Some(Ok(packet)) => {
-                            if packet_tx.send((packet, None)).await.is_err() {
-                                debug!("Datagram packet channel closed for {}", peer_addr);
-                                break;
-                            }
-                        }
+                    let packet = match decode_datagram_packet(&datagram, protocol_version) {
+                        Some(Ok(packet)) => packet,
                         Some(Err(e)) => {
-                            warn!("Failed to decode datagram from {}: {}", peer_addr, e);
+                            close_on_malformed_packet(&connection, peer_addr, "datagram", &e);
+                            break;
                         }
-                        None => {}
+                        None => continue,
+                    };
+                    if packet_tx.send((packet, None)).await.is_err() {
+                        debug!("Datagram packet channel closed for {}", peer_addr);
+                        break;
                     }
                 }
                 Err(e) => {
@@ -802,6 +794,7 @@ fn spawn_bi_accept_loop(
 fn spawn_uni_accept_loop(
     connection: Arc<Connection>,
     packet_tx: mpsc::Sender<(Packet, Option<u64>)>,
+    protocol_version_rx: watch::Receiver<Option<u8>>,
     peer_addr: SocketAddr,
     flow_registry: Arc<Mutex<FlowRegistry>>,
     flow_closed_tx: mpsc::Sender<u64>,
@@ -816,8 +809,10 @@ fn spawn_uni_accept_loop(
                         label, peer_addr
                     );
                     spawn_data_stream_reader(
+                        connection.clone(),
                         recv,
                         packet_tx.clone(),
+                        protocol_version_rx.clone(),
                         peer_addr,
                         flow_registry.clone(),
                         flow_closed_tx.clone(),
@@ -833,7 +828,7 @@ fn spawn_uni_accept_loop(
     });
 }
 
-fn decode_datagram_packet(data: &Bytes) -> Option<Result<Packet>> {
+fn decode_datagram_packet(data: &Bytes, protocol_version: u8) -> Option<Result<Packet>> {
     if data.is_empty() || data[0] == 0x00 {
         return None;
     }
@@ -843,10 +838,11 @@ fn decode_datagram_packet(data: &Bytes) -> Option<Result<Packet>> {
         Ok(h) => h,
         Err(e) => return Some(Err(e)),
     };
-    Some(Packet::decode_from_body(
+    Some(Packet::decode_from_body_with_version(
         fixed_header.packet_type,
         &fixed_header,
         &mut buf,
+        protocol_version,
     ))
 }
 
@@ -876,7 +872,9 @@ fn handle_stream_error(
             ?code,
             error_level, err_tolerance, "Stream error from {peer_addr}, resetting stream"
         );
-        let _ = send.reset(quinn::VarInt::from_u32(code.code()));
+        if let Err(e) = send.reset(quinn::VarInt::from_u32(code.code())) {
+            debug!("stream from {peer_addr} already closed before reset: {e}");
+        }
         return;
     }
 
@@ -943,20 +941,86 @@ fn spawn_discard_handler(
             }
         }
 
-        let _ = send.finish();
+        if let Err(e) = send.finish() {
+            debug!(flow_id = ?flow_id, "discard stream from {peer_addr} already closed: {e}");
+        }
 
         debug!(flow_id = ?flow_id, "completed discard handshake for {peer_addr}");
     });
 }
 
+const CONTROL_FLOW_CLOSE_GRACE: Duration = Duration::from_secs(1);
+
+fn close_code(outcome: &Result<()>) -> mqtt5_protocol::QuicConnectionCode {
+    match outcome {
+        Ok(()) => mqtt5_protocol::QuicConnectionCode::NoError,
+        Err(e) if e.is_normal_disconnect() => mqtt5_protocol::QuicConnectionCode::NoError,
+        Err(
+            MqttError::MalformedPacket(_)
+            | MqttError::ProtocolError(_)
+            | MqttError::InvalidQoS(_)
+            | MqttError::InvalidPacketType(_)
+            | MqttError::InvalidPropertyId(_)
+            | MqttError::DuplicatePropertyId(_)
+            | MqttError::InvalidReasonCode(_)
+            | MqttError::StringTooLong(_)
+            | MqttError::InvalidTopicName(_)
+            | MqttError::PacketTooLarge { .. },
+        ) => mqtt5_protocol::QuicConnectionCode::ProtocolLevel0,
+        Err(_) => mqtt5_protocol::QuicConnectionCode::Unspecified,
+    }
+}
+
+async fn close_after_control_flow(
+    connection: &Connection,
+    peer_addr: SocketAddr,
+    outcome: &Result<()>,
+) {
+    if tokio::time::timeout(CONTROL_FLOW_CLOSE_GRACE, connection.closed())
+        .await
+        .is_ok()
+    {
+        return;
+    }
+    let code = close_code(outcome);
+    debug!(%code, "closing QUIC connection from {peer_addr} after its control flow ended");
+    close_connection(connection, code);
+}
+
+fn close_on_malformed_packet(
+    connection: &Connection,
+    peer_addr: SocketAddr,
+    source: &str,
+    error: &MqttError,
+) {
+    warn!("malformed packet on {source} from {peer_addr}, closing connection: {error}");
+    close_connection(
+        connection,
+        mqtt5_protocol::QuicConnectionCode::ProtocolLevel0,
+    );
+}
+
+fn close_connection(connection: &Connection, code: mqtt5_protocol::QuicConnectionCode) {
+    connection.close(
+        quinn::VarInt::from_u32(code.code()),
+        code.to_string().as_bytes(),
+    );
+}
+
 fn spawn_data_stream_reader(
+    connection: Arc<Connection>,
     mut recv: RecvStream,
     packet_tx: mpsc::Sender<(Packet, Option<u64>)>,
+    protocol_version_rx: watch::Receiver<Option<u8>>,
     peer_addr: SocketAddr,
     flow_registry: Arc<Mutex<FlowRegistry>>,
     flow_closed_tx: mpsc::Sender<u64>,
 ) {
     tokio::spawn(async move {
+        let Some(protocol_version) = negotiated_protocol_version(protocol_version_rx).await else {
+            debug!("client handler ended before CONNECT from {peer_addr}");
+            return;
+        };
         let (flow_id, mut buffer) = match try_read_flow_header(&mut recv).await {
             Ok(result) => {
                 let flow_id = if let (Some(id), Some(flags)) = (result.flow_id, result.flags) {
@@ -981,7 +1045,7 @@ fn spawn_data_stream_reader(
         };
 
         loop {
-            match read_packet_with_buffer(&mut recv, &mut buffer).await {
+            match read_packet_with_buffer(&mut recv, &mut buffer, protocol_version).await {
                 Ok(packet) => {
                     if let Some(id) = flow_id {
                         let mut registry = flow_registry.lock().await;
@@ -994,14 +1058,16 @@ fn spawn_data_stream_reader(
                         break;
                     }
                 }
+                Err(MqttError::ClientClosed) => {
+                    debug!(flow_id = ?flow_id, "QUIC data stream closed from {}", peer_addr);
+                    break;
+                }
+                Err(MqttError::ConnectionError(reason)) => {
+                    debug!(flow_id = ?flow_id, "QUIC data stream from {peer_addr} ended: {reason}");
+                    break;
+                }
                 Err(e) => {
-                    if matches!(e, MqttError::ClientClosed) {
-                        debug!(flow_id = ?flow_id, "QUIC data stream closed from {}", peer_addr);
-                    } else {
-                        warn!(flow_id = ?flow_id, "Error reading from QUIC data stream: {e}");
-                        let stop_code = mqtt5_protocol::QuicStreamCode::IncompletePacket;
-                        let _ = recv.stop(quinn::VarInt::from_u32(stop_code.code()));
-                    }
+                    close_on_malformed_packet(&connection, peer_addr, "data stream", &e);
                     break;
                 }
             }
@@ -1016,7 +1082,9 @@ fn spawn_data_stream_reader(
                 debug!(flow_id = ?id, "Preserving flow state (err_tolerance >= 2) for recovery");
             } else if registry.remove(id).is_some() {
                 debug!(flow_id = ?id, "Removed flow from registry");
-                let _ = flow_closed_tx.send(id.raw()).await;
+                if flow_closed_tx.send(id.raw()).await.is_err() {
+                    debug!(flow_id = ?id, "client handler ended before the flow closed");
+                }
             }
         }
     });

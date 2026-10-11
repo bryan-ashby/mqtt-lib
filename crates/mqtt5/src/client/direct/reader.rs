@@ -29,11 +29,12 @@ use super::handlers::handle_incoming_packet_no_writer;
 #[cfg(feature = "transport-quic")]
 use crate::transport::flow::{
     FlowFlags, FlowHeader, FlowId, FLOW_TYPE_CLIENT_DATA, FLOW_TYPE_CONTROL, FLOW_TYPE_SERVER_DATA,
+    FLOW_TYPE_USER_DEFINED,
 };
 #[cfg(feature = "transport-quic")]
 use crate::transport::packet_io::read_packet_from_stream;
 #[cfg(feature = "transport-quic")]
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
 #[cfg(feature = "transport-quic")]
 use quinn::Connection;
 #[cfg(feature = "transport-quic")]
@@ -435,76 +436,94 @@ struct ServerFlowResult {
 }
 
 #[cfg(feature = "transport-quic")]
-async fn try_read_server_flow_header(recv: &mut quinn::RecvStream) -> Result<ServerFlowResult> {
+enum ServerFlow {
+    Mqtt(ServerFlowResult),
+    UserDefined,
+}
+
+#[cfg(feature = "transport-quic")]
+fn refuse_user_defined_flow(recv: &mut quinn::RecvStream) {
+    tracing::debug!("Refusing user-defined flow on server-initiated stream");
+    let _ = recv.stop(quinn::VarInt::from_u32(
+        mqtt5_protocol::QuicStreamCode::FlowRefused.code(),
+    ));
+}
+
+#[cfg(feature = "transport-quic")]
+async fn try_read_server_flow_header(recv: &mut quinn::RecvStream) -> Result<ServerFlow> {
     let chunk = recv
         .read_chunk(1, true)
         .await
         .map_err(|e| MqttError::ConnectionError(format!("Failed to peek stream: {e}")))?;
 
     let Some(chunk) = chunk else {
-        return Ok(ServerFlowResult {
+        return Ok(ServerFlow::Mqtt(ServerFlowResult {
             flow_id: None,
             flags: None,
             expire: None,
             leftover: BytesMut::new(),
-        });
+        }));
     };
 
     if chunk.bytes.is_empty() {
-        return Ok(ServerFlowResult {
+        return Ok(ServerFlow::Mqtt(ServerFlowResult {
             flow_id: None,
             flags: None,
             expire: None,
             leftover: BytesMut::new(),
-        });
+        }));
     }
 
     let first_byte = chunk.bytes[0];
+    if first_byte == FLOW_TYPE_USER_DEFINED {
+        return Ok(ServerFlow::UserDefined);
+    }
     if !is_flow_header_byte(first_byte) {
         let mut leftover = BytesMut::with_capacity(chunk.bytes.len());
         leftover.extend_from_slice(&chunk.bytes);
-        return Ok(ServerFlowResult {
+        return Ok(ServerFlow::Mqtt(ServerFlowResult {
             flow_id: None,
             flags: None,
             expire: None,
             leftover,
-        });
+        }));
     }
 
     let mut header_buf = Vec::with_capacity(32);
     header_buf.extend_from_slice(&chunk.bytes);
 
-    while header_buf.len() < 32 {
-        match recv.read_chunk(32 - header_buf.len(), true).await {
-            Ok(Some(chunk)) if !chunk.bytes.is_empty() => {
-                header_buf.extend_from_slice(&chunk.bytes);
-            }
-            Ok(_) => break,
-            Err(e) => {
-                return Err(MqttError::ConnectionError(format!(
-                    "Failed to read flow header: {e}"
-                )));
-            }
+    let (flow_header, leftover) = loop {
+        let mut bytes = Bytes::copy_from_slice(&header_buf);
+        match FlowHeader::decode(&mut bytes) {
+            Ok(header) => break (header, BytesMut::from(bytes.as_ref())),
+            Err(e) if header_buf.len() >= 32 => return Err(e),
+            Err(_) => match recv.read_chunk(32 - header_buf.len(), true).await {
+                Ok(Some(chunk)) if !chunk.bytes.is_empty() => {
+                    header_buf.extend_from_slice(&chunk.bytes);
+                }
+                Ok(_) => {
+                    return Err(MqttError::ProtocolError(
+                        "incomplete flow header".to_string(),
+                    ));
+                }
+                Err(e) => {
+                    return Err(MqttError::ConnectionError(format!(
+                        "Failed to read flow header: {e}"
+                    )));
+                }
+            },
         }
-    }
-
-    let mut bytes = Bytes::from(header_buf);
-    let flow_header = FlowHeader::decode(&mut bytes)?;
-
-    let mut leftover = BytesMut::with_capacity(bytes.remaining());
-    if bytes.has_remaining() {
-        leftover.extend_from_slice(&bytes);
-    }
+    };
 
     match flow_header {
         FlowHeader::Control(h) => {
             tracing::trace!(flow_id = ?h.flow_id, "Parsed control flow header from server");
-            Ok(ServerFlowResult {
+            Ok(ServerFlow::Mqtt(ServerFlowResult {
                 flow_id: Some(h.flow_id),
                 flags: Some(h.flags),
                 expire: None,
                 leftover,
-            })
+            }))
         }
         FlowHeader::ClientData(h) | FlowHeader::ServerData(h) => {
             let expire = if h.expire_interval > 0 {
@@ -513,22 +532,14 @@ async fn try_read_server_flow_header(recv: &mut quinn::RecvStream) -> Result<Ser
                 None
             };
             tracing::debug!(flow_id = ?h.flow_id, is_server = h.is_server_flow(), expire = ?expire, "Parsed data flow header from server");
-            Ok(ServerFlowResult {
+            Ok(ServerFlow::Mqtt(ServerFlowResult {
                 flow_id: Some(h.flow_id),
                 flags: Some(h.flags),
                 expire,
                 leftover,
-            })
+            }))
         }
-        FlowHeader::UserDefined(_) => {
-            tracing::trace!("Ignoring user-defined flow header");
-            Ok(ServerFlowResult {
-                flow_id: None,
-                flags: None,
-                expire: None,
-                leftover,
-            })
-        }
+        FlowHeader::UserDefined(_) => Ok(ServerFlow::UserDefined),
     }
 }
 
@@ -563,11 +574,18 @@ async fn end_data_stream(ctx: &PacketReaderContext, flow_id: Option<FlowId>, err
 #[cfg(feature = "transport-quic")]
 async fn quic_stream_reader_task(
     mut recv: quinn::RecvStream,
-    send: quinn::SendStream,
+    mut send: quinn::SendStream,
     ctx: PacketReaderContext,
 ) {
     let (flow_id, mut buffer) = match try_read_server_flow_header(&mut recv).await {
-        Ok(result) => {
+        Ok(ServerFlow::UserDefined) => {
+            refuse_user_defined_flow(&mut recv);
+            let _ = send.reset(quinn::VarInt::from_u32(
+                mqtt5_protocol::QuicStreamCode::FlowRefused.code(),
+            ));
+            return;
+        }
+        Ok(ServerFlow::Mqtt(result)) => {
             let flow_id = if let (Some(id), Some(flags)) = (result.flow_id, result.flags) {
                 tracing::debug!(
                     flow_id = ?id,
@@ -623,7 +641,11 @@ async fn quic_stream_reader_task(
 #[cfg(feature = "transport-quic")]
 async fn quic_uni_stream_reader_task(mut recv: quinn::RecvStream, ctx: PacketReaderContext) {
     let (flow_id, mut buffer) = match try_read_server_flow_header(&mut recv).await {
-        Ok(result) => {
+        Ok(ServerFlow::UserDefined) => {
+            refuse_user_defined_flow(&mut recv);
+            return;
+        }
+        Ok(ServerFlow::Mqtt(result)) => {
             let flow_id = if let (Some(id), Some(flags)) = (result.flow_id, result.flags) {
                 tracing::debug!(
                     flow_id = ?id,
@@ -648,8 +670,9 @@ async fn quic_uni_stream_reader_task(mut recv: quinn::RecvStream, ctx: PacketRea
         let outcome = match read {
             Ok(packet) => {
                 tracing::trace!(flow_id = ?flow_id, "Received packet on unidirectional server stream");
-                handle_incoming_packet_no_writer(packet, flow_id, &ctx.incoming_handlers(None))
-                    .await
+                let ack_delivery = ctx.ack_delivery();
+                let handlers = ctx.incoming_handlers(ack_delivery.as_ref());
+                handle_incoming_packet_no_writer(packet, flow_id, &handlers).await
             }
             Err(e) => Err(e),
         };
